@@ -26,6 +26,7 @@
 </p>
 
 ---
+_NOTE: This is a fork of OpenWhisper that includes a setting to enable submitting any automated clipboard paste_
 
 OpenWhispr turns your voice into text, notes, and actions from your desktop. Press a hotkey, speak, and your words appear at your cursor. Choose between fully private offline transcription with local speech-to-text engines like Whisper and NVIDIA Parakeet — where your audio never leaves your device — or cloud processing for speed. No data collection, no telemetry, fully open source.
 
