@@ -29,6 +29,9 @@ typedef enum {
     PASTE_MODE_CTRL_V        = 0,
     PASTE_MODE_CTRL_SHIFT_V  = 1,
     PASTE_MODE_SHIFT_INSERT  = 2,
+    /* Not a paste: sends a bare Enter keystroke (submit-after-paste feature).
+     * Lives in this enum so the portal key-injection path can reuse it. */
+    PASTE_MODE_PRESS_ENTER   = 3,
 } paste_mode_t;
 
 #ifdef HAVE_GIO
@@ -44,6 +47,7 @@ typedef enum {
 #define PORTAL_KEY_LEFTSHIFT 42
 #define PORTAL_KEY_V         47
 #define PORTAL_KEY_INSERT    110
+#define PORTAL_KEY_ENTER     28
 
 static int portal_exit_code = 0;
 
@@ -89,7 +93,11 @@ static void portal_emit_key(PortalData *app, gint32 keycode, guint32 pressed,
 
 static void portal_send_paste(PortalData *app)
 {
-    if (app->mode == PASTE_MODE_SHIFT_INSERT) {
+    if (app->mode == PASTE_MODE_PRESS_ENTER) {
+        portal_emit_key(app, PORTAL_KEY_ENTER, 1, "Enter press");
+        usleep(20000);
+        portal_emit_key(app, PORTAL_KEY_ENTER, 0, "Enter release");
+    } else if (app->mode == PASTE_MODE_SHIFT_INSERT) {
         portal_emit_key(app, PORTAL_KEY_LEFTSHIFT, 1, "Shift press");
         portal_emit_key(app, PORTAL_KEY_INSERT,    1, "Insert press");
         usleep(20000);
@@ -590,6 +598,68 @@ static int send_media_play_pause(void) {
     return 0;
 }
 
+static int send_press_enter(void) {
+#ifdef HAVE_UINPUT
+    /* KEY_ENTER = 28 (evdev) — works without X11 display */
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd >= 0) {
+        if (ioctl(fd, UI_SET_EVBIT, EV_KEY) >= 0 &&
+            ioctl(fd, UI_SET_KEYBIT, KEY_ENTER) >= 0) {
+
+            struct uinput_setup usetup;
+            memset(&usetup, 0, sizeof(usetup));
+            usetup.id.bustype = BUS_USB;
+            usetup.id.vendor  = 0x1234;
+            usetup.id.product = 0x5678;
+            snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "openwhispr-enter");
+
+            if (ioctl(fd, UI_DEV_SETUP, &usetup) >= 0 &&
+                ioctl(fd, UI_DEV_CREATE) >= 0) {
+
+                usleep(50000);
+
+                emit(fd, EV_KEY, KEY_ENTER, 1);
+                emit(fd, EV_SYN, SYN_REPORT, 0);
+                usleep(8000);
+                emit(fd, EV_KEY, KEY_ENTER, 0);
+                emit(fd, EV_SYN, SYN_REPORT, 0);
+                usleep(20000);
+
+                ioctl(fd, UI_DEV_DESTROY);
+                close(fd);
+                return 0;
+            }
+        }
+        close(fd);
+    }
+#endif
+
+    /* Fallback to XTest */
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 1;
+
+    int event_base, error_base, major, minor;
+    if (!XTestQueryExtension(dpy, &event_base, &error_base, &major, &minor)) {
+        XCloseDisplay(dpy);
+        return 2;
+    }
+
+    KeyCode enter = XKeysymToKeycode(dpy, XK_Return);
+    if (enter == 0) {
+        XCloseDisplay(dpy);
+        return 2;
+    }
+
+    XTestFakeKeyEvent(dpy, enter, True, CurrentTime);
+    usleep(8000);
+    XTestFakeKeyEvent(dpy, enter, False, CurrentTime);
+
+    XFlush(dpy);
+    usleep(20000);
+    XCloseDisplay(dpy);
+    return 0;
+}
+
 /* Resolve the paste key sequence. --shift-insert wins outright (used when the
  * caller already knows context is unknown or Konsole). Otherwise: terminal
  * detection via atspi, then X11 class, then parent class — same fallback
@@ -629,6 +699,7 @@ int main(int argc, char *argv[]) {
     int use_uinput = 0;
     int use_portal = 0;
     int media_play_pause = 0;
+    int press_enter = 0;
     const char *restore_token = NULL;
     Window target_window = None;
 
@@ -643,6 +714,8 @@ int main(int argc, char *argv[]) {
             use_portal = 1;
         } else if (strcmp(argv[i], "--media-play-pause") == 0) {
             media_play_pause = 1;
+        } else if (strcmp(argv[i], "--press-enter") == 0) {
+            press_enter = 1;
         } else if (strcmp(argv[i], "--restore-token") == 0 && i + 1 < argc) {
             restore_token = argv[++i];
         } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
@@ -652,6 +725,10 @@ int main(int argc, char *argv[]) {
 
     if (media_play_pause) {
         return send_media_play_pause();
+    }
+
+    if (press_enter) {
+        return send_press_enter();
     }
 
     if (use_portal) {

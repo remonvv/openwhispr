@@ -61,6 +61,9 @@ const RESTORE_DELAYS = {
   linux_kde_wayland: 1200,
 };
 
+// Fixed settle after paste keystroke before Enter — gives async UIs time to apply Ctrl+V.
+const SUBMIT_AFTER_PASTE_DELAY_MS = 250;
+
 function writeClipboardInRenderer(webContents, text) {
   if (!webContents || !webContents.executeJavaScript) {
     return Promise.reject(new Error("Invalid webContents for clipboard write"));
@@ -724,6 +727,130 @@ class ClipboardManager {
     }
   }
 
+  _spawnAndWait(cmd, args, { timeoutMs = 2000 } = {}) {
+    return new Promise((resolve, reject) => {
+      let hasTimedOut = false;
+      const proc = spawn(cmd, args, {
+        windowsHide: process.platform === "win32",
+      });
+
+      proc.on("close", (code) => {
+        if (hasTimedOut) return;
+        clearTimeout(timeoutId);
+        if (code === 0) resolve();
+        else reject(new Error(`${cmd} exited with code ${code}`));
+      });
+
+      proc.on("error", (error) => {
+        if (hasTimedOut) return;
+        clearTimeout(timeoutId);
+        reject(error);
+      });
+
+      const timeoutId = setTimeout(() => {
+        hasTimedOut = true;
+        killProcess(proc, "SIGKILL");
+        reject(new Error(`${cmd} timed out`));
+      }, timeoutMs);
+    });
+  }
+
+  async _pressEnterLinux() {
+    // Native binary first — mirrors the paste path, and covers setups where no
+    // external tool (xdotool/wtype/ydotool) is installed. Tries uinput, then XTest.
+    const linuxFastPaste = this.resolveLinuxFastPasteBinary();
+    if (linuxFastPaste) {
+      try {
+        await this._spawnAndWait(linuxFastPaste, ["--press-enter"]);
+        return;
+      } catch (error) {
+        this.safeLog("⚠️ linux-fast-paste --press-enter failed, falling back to system tools", {
+          error: error?.message || String(error),
+        });
+      }
+    }
+
+    const { isWayland, xwaylandAvailable, isWlroots } = getLinuxSessionInfo();
+    const xdotoolExists = this.commandExists("xdotool");
+    const wtypeExists = this.commandExists("wtype");
+    const canUseWtype = isWayland && isWlroots && wtypeExists;
+    const canUseXdotool = isWayland ? xwaylandAvailable && xdotoolExists : xdotoolExists;
+    const canUseYdotool = this.commandExists("ydotool") && this._isYdotoolDaemonRunning();
+
+    // ydotool 0.1.x resolves names against evdev KEY_* constants ("enter" → KEY_ENTER);
+    // 1.0.x uses raw keycodes (28 = KEY_ENTER)
+    const ydotoolEntry = canUseYdotool
+      ? [
+          {
+            cmd: "ydotool",
+            args: this._isYdotoolLegacy() ? ["key", "enter"] : ["key", "28:1", "28:0"],
+          },
+        ]
+      : [];
+    const wtypeEntry = canUseWtype ? [{ cmd: "wtype", args: ["-k", "Return"] }] : [];
+    const xdotoolEntry = canUseXdotool ? [{ cmd: "xdotool", args: ["key", "Return"] }] : [];
+
+    // Same compositor-aware priority ordering as the paste fallback chain
+    let candidates;
+    if (!isWayland) {
+      candidates = [...xdotoolEntry, ...ydotoolEntry];
+    } else if (isWlroots) {
+      candidates = [...wtypeEntry, ...xdotoolEntry, ...ydotoolEntry];
+    } else {
+      candidates = [...ydotoolEntry, ...xdotoolEntry, ...wtypeEntry];
+    }
+
+    if (candidates.length === 0) {
+      throw new Error("No tool available to send Enter on Linux");
+    }
+
+    let lastError;
+    for (const { cmd, args } of candidates) {
+      try {
+        await this._spawnAndWait(cmd, args);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError || new Error("Failed to send Enter on Linux");
+  }
+
+  async _pressEnter() {
+    const platform = process.platform;
+
+    if (platform === "darwin") {
+      await this._spawnAndWait("osascript", [
+        "-e",
+        'tell application "System Events" to key code 36',
+      ]);
+      return;
+    }
+
+    if (platform === "win32") {
+      const nircmdPath = this.getNircmdPath();
+      if (nircmdPath) {
+        await this._spawnAndWait(nircmdPath, ["sendkeypress", "enter"]);
+        return;
+      }
+
+      await this._spawnAndWait("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')",
+      ]);
+      return;
+    }
+
+    await this._pressEnterLinux();
+  }
+
   async pasteText(text, options = {}) {
     const previousPaste = this.pasteQueue.catch(() => {});
     let markRestoreComplete;
@@ -820,6 +947,20 @@ class ClipboardManager {
           expectedClipboardText: text,
         });
         method = pasteResult?.method || "linux-tools";
+      }
+
+      if (options.submitAfterPaste) {
+        await new Promise((resolve) => setTimeout(resolve, SUBMIT_AFTER_PASTE_DELAY_MS));
+        try {
+          await this._pressEnter();
+          this.safeLog("✅ Submit key sent after paste", {
+            settleMs: SUBMIT_AFTER_PASTE_DELAY_MS,
+          });
+        } catch (enterError) {
+          this.safeLog("⚠️ Submit after paste failed (non-fatal)", {
+            error: enterError?.message || String(enterError),
+          });
+        }
       }
 
       this.safeLog("✅ Paste operation complete", {

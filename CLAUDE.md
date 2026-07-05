@@ -282,6 +282,7 @@ Settings stored in localStorage with these keys:
 - `hotkey`: Custom hotkey configuration
 - `hasCompletedOnboarding`: Onboarding completion flag
 - `customDictionary`: JSON array of words/phrases for improved transcription accuracy
+- `submitAfterPasteEnabled`: Boolean to send Enter after auto-paste
 
 Secret env vars (12 total: 7 BYOK API keys + 5 enterprise cloud creds — see `SECRET_KEYS` in `environment.js`) are encrypted at rest via Electron `safeStorage` and stored as per-key files under `userData/secure-keys/`. They are loaded into `process.env` at startup by `EnvironmentManager.init()`. Renderer reads them via IPC (`get-*-key`) and writes via debounced IPC (`save-*-key`). On Linux without a keyring, secrets fall back to plaintext.
 

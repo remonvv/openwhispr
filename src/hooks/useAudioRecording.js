@@ -144,10 +144,20 @@ export const useAudioRecording = (toast, options = {}) => {
           result.text = expandSnippets(result.text, getSettings().snippets);
 
           setTranscript(result.text);
-          window.electronAPI?.completeDictationPreview?.({ text: result.text });
 
           const isStreaming = result.source?.includes("streaming");
-          const { autoPasteEnabled, keepTranscriptionInClipboard } = getSettings();
+          const { autoPasteEnabled, keepTranscriptionInClipboard, submitAfterPasteEnabled } =
+            getSettings();
+          const willSubmitAfterPaste = autoPasteEnabled && submitAfterPasteEnabled;
+
+          // Only await when Enter will be sent afterwards: the round-trip guarantees the
+          // preview is completed before the submit keystroke, but costs paste latency.
+          const previewCompleted = window.electronAPI?.completeDictationPreview?.({
+            text: result.text,
+          });
+          if (willSubmitAfterPaste) {
+            await previewCompleted;
+          }
 
           if (autoPasteEnabled) {
             const pasteStart = performance.now();
@@ -155,6 +165,7 @@ export const useAudioRecording = (toast, options = {}) => {
               ...(isStreaming ? { fromStreaming: true } : {}),
               restoreClipboard: !keepTranscriptionInClipboard,
               allowClipboardFallback: isAccessibilitySkipped(),
+              ...(submitAfterPasteEnabled ? { submitAfterPaste: true } : {}),
             });
             logger.info(
               "Paste timing",
