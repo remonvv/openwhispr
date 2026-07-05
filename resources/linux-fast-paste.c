@@ -94,6 +94,15 @@ static void portal_emit_key(PortalData *app, gint32 keycode, guint32 pressed,
 static void portal_send_paste(PortalData *app)
 {
     if (app->mode == PASTE_MODE_PRESS_ENTER) {
+        /* Best-effort release of modifiers possibly still held by the user's
+         * hotkey so the submit is a bare Enter. Key-ups for unheld keys are
+         * no-ops; whether they clear a physically held key is compositor-
+         * dependent. evdev: L/R ctrl, shift, alt, meta. */
+        static const gint32 mods[] = { 29, 97, 42, 54, 56, 100, 125, 126 };
+        for (guint i = 0; i < G_N_ELEMENTS(mods); i++) {
+            portal_emit_key(app, mods[i], 0, "Modifier release");
+        }
+        usleep(8000);
         portal_emit_key(app, PORTAL_KEY_ENTER, 1, "Enter press");
         usleep(20000);
         portal_emit_key(app, PORTAL_KEY_ENTER, 0, "Enter release");
@@ -598,43 +607,52 @@ static int send_media_play_pause(void) {
     return 0;
 }
 
-static int send_press_enter(void) {
 #ifdef HAVE_UINPUT
+/* Note: unlike the XTest and portal paths, this cannot clear modifiers the
+ * user still holds — the kernel drops key-up events from a device that never
+ * pressed the key, and a synthetic press+release cycle risks side effects
+ * (e.g. a bare Alt tap focuses the menu bar in many apps). */
+static int press_enter_via_uinput(void) {
     /* KEY_ENTER = 28 (evdev) — works without X11 display */
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (fd >= 0) {
-        if (ioctl(fd, UI_SET_EVBIT, EV_KEY) >= 0 &&
-            ioctl(fd, UI_SET_KEYBIT, KEY_ENTER) >= 0) {
-
-            struct uinput_setup usetup;
-            memset(&usetup, 0, sizeof(usetup));
-            usetup.id.bustype = BUS_USB;
-            usetup.id.vendor  = 0x1234;
-            usetup.id.product = 0x5678;
-            snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "openwhispr-enter");
-
-            if (ioctl(fd, UI_DEV_SETUP, &usetup) >= 0 &&
-                ioctl(fd, UI_DEV_CREATE) >= 0) {
-
-                usleep(50000);
-
-                emit(fd, EV_KEY, KEY_ENTER, 1);
-                emit(fd, EV_SYN, SYN_REPORT, 0);
-                usleep(8000);
-                emit(fd, EV_KEY, KEY_ENTER, 0);
-                emit(fd, EV_SYN, SYN_REPORT, 0);
-                usleep(20000);
-
-                ioctl(fd, UI_DEV_DESTROY);
-                close(fd);
-                return 0;
-            }
-        }
-        close(fd);
+    if (fd < 0) {
+        fprintf(stderr, "Cannot open /dev/uinput: %s\n", strerror(errno));
+        return 3;
     }
+
+    if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, KEY_ENTER) < 0) {
+        close(fd);
+        return 4;
+    }
+
+    struct uinput_setup usetup;
+    memset(&usetup, 0, sizeof(usetup));
+    usetup.id.bustype = BUS_USB;
+    usetup.id.vendor  = 0x1234;
+    usetup.id.product = 0x5678;
+    snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "openwhispr-enter");
+
+    if (ioctl(fd, UI_DEV_SETUP, &usetup) < 0 ||
+        ioctl(fd, UI_DEV_CREATE) < 0) {
+        close(fd);
+        return 4;
+    }
+
+    usleep(50000);
+
+    emit_key(fd, KEY_ENTER, 1);
+    usleep(8000);
+    emit_key(fd, KEY_ENTER, 0);
+    usleep(20000);
+
+    ioctl(fd, UI_DEV_DESTROY);
+    close(fd);
+    return 0;
+}
 #endif
 
-    /* Fallback to XTest */
+static int press_enter_via_xtest(void) {
     Display *dpy = XOpenDisplay(NULL);
     if (!dpy) return 1;
 
@@ -650,14 +668,53 @@ static int send_press_enter(void) {
         return 2;
     }
 
+    /* Temporarily release modifiers still held by the user's hotkey so the
+     * submit is a bare Enter — Ctrl+Enter and friends trigger different
+     * actions in many apps (same trick as xdotool --clearmodifiers). */
+    KeyCode released[64];
+    int releasedCount = 0;
+    char keymap[32];
+    XQueryKeymap(dpy, keymap);
+    XModifierKeymap *modmap = XGetModifierMapping(dpy);
+    if (modmap) {
+        int total = 8 * modmap->max_keypermod;
+        for (int i = 0; i < total; i++) {
+            KeyCode kc = modmap->modifiermap[i];
+            if (kc == 0 || !(keymap[kc / 8] & (1 << (kc % 8)))) continue;
+            int seen = 0;
+            for (int j = 0; j < releasedCount; j++) {
+                if (released[j] == kc) { seen = 1; break; }
+            }
+            if (seen || releasedCount >= (int)(sizeof(released) / sizeof(released[0]))) continue;
+            XTestFakeKeyEvent(dpy, kc, False, CurrentTime);
+            released[releasedCount++] = kc;
+        }
+        XFreeModifiermap(modmap);
+    }
+    if (releasedCount > 0) {
+        XFlush(dpy);
+        usleep(8000);
+    }
+
     XTestFakeKeyEvent(dpy, enter, True, CurrentTime);
     usleep(8000);
     XTestFakeKeyEvent(dpy, enter, False, CurrentTime);
+
+    for (int i = releasedCount - 1; i >= 0; i--) {
+        XTestFakeKeyEvent(dpy, released[i], True, CurrentTime);
+    }
 
     XFlush(dpy);
     usleep(20000);
     XCloseDisplay(dpy);
     return 0;
+}
+
+static int send_press_enter(void) {
+#ifdef HAVE_UINPUT
+    if (press_enter_via_uinput() == 0) return 0;
+#endif
+    return press_enter_via_xtest();
 }
 
 /* Resolve the paste key sequence. --shift-insert wins outright (used when the
@@ -728,6 +785,25 @@ int main(int argc, char *argv[]) {
     }
 
     if (press_enter) {
+        /* Honor the caller's channel choice so a "success" on a channel that
+         * can't reach the focused window (e.g. XTest with a native Wayland
+         * app) doesn't mask a delivery failure. No flag: uinput then XTest. */
+        if (use_portal) {
+#ifdef HAVE_GIO
+            return paste_via_portal(PASTE_MODE_PRESS_ENTER, restore_token);
+#else
+            fprintf(stderr, "portal support not compiled in\n");
+            return 5;
+#endif
+        }
+        if (use_uinput) {
+#ifdef HAVE_UINPUT
+            return press_enter_via_uinput();
+#else
+            fprintf(stderr, "uinput support not compiled in\n");
+            return 3;
+#endif
+        }
         return send_press_enter();
     }
 
