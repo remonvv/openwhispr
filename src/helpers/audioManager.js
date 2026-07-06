@@ -96,7 +96,16 @@ function resolveReasoningRoute(text, settings, agentName, voiceAgentRequested) {
   if (kind === "cleanup") {
     return {
       kind: "cleanup",
-      config: { disableThinking: settings.cleanupDisableThinking },
+      config: {
+        disableThinking: settings.cleanupDisableThinking,
+        temperature: 0.3,
+        systemPrompt: resolvePrompt("cleanup", {
+          agentName,
+          language: settings.preferredLanguage,
+          customDictionary: getDictionaryHintWords(settings),
+          uiLanguage: settings.uiLanguage,
+        }),
+      },
     };
   }
   return { kind: "skip" };
@@ -1577,7 +1586,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
             const res = await window.electronAPI.cloudReason(processedText, {
               agentName,
               customDictionary: getDictionaryHintWords(settings),
-              customPrompt: this.getCustomPrompt(),
+              systemPrompt: route.config.systemPrompt,
               language: settings.preferredLanguage || "auto",
               locale: settings.uiLanguage || "en",
               sttProvider: result.sttProvider,
@@ -1637,10 +1646,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   getCustomDictionaryArray() {
     return getSettings().customDictionary;
-  }
-
-  getCustomPrompt() {
-    return getSettings().customPrompts.cleanup || undefined;
   }
 
   getKeyterms() {
@@ -2998,7 +3003,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
             const res = await window.electronAPI.cloudReason(finalText, {
               agentName,
               customDictionary: getDictionaryHintWords(stSettings),
-              customPrompt: this.getCustomPrompt(),
+              systemPrompt: route.config.systemPrompt,
               language: stSettings.preferredLanguage || "auto",
               locale: stSettings.uiLanguage || "en",
               sttProvider: this.getStreamingProviderName(),
